@@ -1,10 +1,9 @@
 package com.batchExample.Movies.config;
 
-import com.batchExample.Movies.entity.genre.Genre;
+import com.batchExample.Movies.entity.dto.MovieDto;
 import com.batchExample.Movies.entity.movie.Movie;
 import com.batchExample.Movies.repository.GenreRepository;
 import com.batchExample.Movies.repository.MovieRepository;
-import com.batchExample.Movies.utils.EntityUtils;
 import lombok.AllArgsConstructor;
 import org.springframework.batch.core.Job;
 import org.springframework.batch.core.Step;
@@ -14,24 +13,22 @@ import org.springframework.batch.core.configuration.annotation.StepBuilderFactor
 import org.springframework.batch.item.data.RepositoryItemWriter;
 import org.springframework.batch.item.file.FlatFileItemReader;
 import org.springframework.batch.item.file.LineMapper;
+import org.springframework.batch.item.file.mapping.BeanWrapperFieldSetMapper;
 import org.springframework.batch.item.file.mapping.DefaultLineMapper;
-import org.springframework.batch.item.file.mapping.FieldSetMapper;
 import org.springframework.batch.item.file.transform.DelimitedLineTokenizer;
+import org.springframework.cache.CacheManager;
+import org.springframework.cache.annotation.EnableCaching;
+import org.springframework.cache.concurrent.ConcurrentMapCacheManager;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 import org.springframework.core.io.FileSystemResource;
 
-import java.util.Arrays;
-import java.util.HashSet;
-import java.util.List;
-import java.util.Set;
-
-import static com.batchExample.Movies.constant.Constant.DEMO_CSV;
 import static com.batchExample.Movies.constant.Constant.MAIN_CSV;
 
 @Configuration
 @AllArgsConstructor
 @EnableBatchProcessing
+@EnableCaching
 public class CsvItemConfiguration {
     private JobBuilderFactory jobBuilderFactory;
     private StepBuilderFactory stepBuilderFactory;
@@ -39,10 +36,10 @@ public class CsvItemConfiguration {
     private GenreRepository genreRepository;
 
     @Bean
-    public FlatFileItemReader<Movie> reader() {
-        FlatFileItemReader<Movie> movieReader = new FlatFileItemReader<>();
+    public FlatFileItemReader<MovieDto> reader() {
+        FlatFileItemReader<MovieDto> movieReader = new FlatFileItemReader<>();
 
-        movieReader.setResource(new FileSystemResource(DEMO_CSV));
+        movieReader.setResource(new FileSystemResource(MAIN_CSV));
         movieReader.setName("csvReader");
         movieReader.setLinesToSkip(1);
         movieReader.setLineMapper(getMovieLineMapper());
@@ -50,61 +47,31 @@ public class CsvItemConfiguration {
         return movieReader;
     }
 
-    public LineMapper<Movie> getMovieLineMapper() {
-        DefaultLineMapper<Movie> movieLineMapper = new DefaultLineMapper<>();
+    public LineMapper<MovieDto> getMovieLineMapper() {
+        DefaultLineMapper<MovieDto> movieLineMapper = new DefaultLineMapper<>();
         DelimitedLineTokenizer delimitedLineTokenizer = new DelimitedLineTokenizer();
-        FieldSetMapper<Movie> beanMapper = createBeanMapper();
+        BeanWrapperFieldSetMapper<MovieDto> fieldSetMapper = new BeanWrapperFieldSetMapper<>();
 
         delimitedLineTokenizer.setDelimiter(",");
         delimitedLineTokenizer.setStrict(false);
         delimitedLineTokenizer.setNames("title", "originalLanguage", "releaseDate", "popularity", "budget", "revenue", "runtime", "status", "genres");
 
+        fieldSetMapper.setTargetType(MovieDto.class);
+
         movieLineMapper.setLineTokenizer(delimitedLineTokenizer);
-        movieLineMapper.setFieldSetMapper(beanMapper);
+        movieLineMapper.setFieldSetMapper(fieldSetMapper);
 
         return movieLineMapper;
     }
 
-    private FieldSetMapper<Movie> createBeanMapper() {
-        return fieldSet -> {
-            Movie movie = new Movie();
-            movie.setTitle(fieldSet.readString("title"));
-            movie.setOriginalLanguage(fieldSet.readString("originalLanguage"));
-            movie.setReleaseDate(EntityUtils.convertToMySQLDate(fieldSet.readString("releaseDate")));
-            movie.setPopularity(fieldSet.readDouble("popularity"));
-            movie.setBudget(fieldSet.readLong("budget"));
-            movie.setRevenue(fieldSet.readLong("revenue"));
-            movie.setRuntime(fieldSet.readInt("runtime"));
-            movie.setStatus(fieldSet.readString("status"));
-            Set<Genre> genres = parseGenres(fieldSet.readString("genres"));
-            movie.setGenres(genres);
-            return movie;
-        };
-    }
-
-    private Set<Genre> parseGenres(String genreString) {
-        List<String> genreNames = Arrays.stream(genreString.split(", ")).toList();
-
-        Set<Genre> genres = new HashSet<>();
-
-        for (String genreName : genreNames) {
-            Genre existingGenre = genreRepository.findByName(genreName).orElse(null);
-
-            if (existingGenre == null) {
-                existingGenre = new Genre();
-                existingGenre.setName(genreName);
-                genreRepository.save(existingGenre);
-            }
-
-            genres.add(existingGenre);
-        }
-
-        return genres;
+    @Bean
+    public MovieProcessor processor() {
+        return new MovieProcessor(genreRepository, cacheManager());
     }
 
     @Bean
-    public MovieProcessor processor() {
-        return new MovieProcessor();
+    public CacheManager cacheManager() {
+        return new ConcurrentMapCacheManager("genres");
     }
 
     @Bean
@@ -117,8 +84,8 @@ public class CsvItemConfiguration {
     }
 
     @Bean
-    public Step stepOne() {
-        return stepBuilderFactory.get("csvMovie-step").<Movie, Movie>chunk(10)
+    public Step stepProcess() {
+        return stepBuilderFactory.get("csvMovie-step").<MovieDto, Movie>chunk(100)
                 .reader(reader())
                 .processor(processor())
                 .writer(writer())
@@ -126,9 +93,17 @@ public class CsvItemConfiguration {
     }
 
     @Bean
+    public Step stepMoveFile() {
+        return stepBuilderFactory.get("moveFileStep")
+                .tasklet(new FileMoveTasklet())
+                .build();
+    }
+
+    @Bean
     public Job jobRun() {
         return jobBuilderFactory.get("importMovies")
-                .flow(stepOne())
+                .flow(stepProcess())
+                .next(stepMoveFile())
                 .end()
                 .build();
     }
